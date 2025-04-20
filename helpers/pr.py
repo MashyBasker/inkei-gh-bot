@@ -1,5 +1,8 @@
 import logging
 import re
+import json
+import aiohttp
+import os
 from .install import GitHubClient
 from .endpoints import (
     get_pull_url, 
@@ -44,7 +47,7 @@ async def process_pull_request(payload):
         files = await client.get(files_url)
         
         # Analyze PR content
-        analysis_results = await analyze_pr_content(client, owner, repo, pr_info, files)
+        analysis_results = await analyze_pr_content_with_gemini(client, owner, repo, pr_info, files)
         
         # Add a comment with analysis results
         if analysis_results:
@@ -161,12 +164,146 @@ async def analyze_pr_content(client, owner, repo, pr_info, files):
         "has_tests": has_tests
     }
 
+async def analyze_pr_content_with_gemini(client, owner, repo, pr_info, files):
+    """
+    Analyze the content of a pull request with Gemini AI.
+    
+    Args:
+        client: GitHub client
+        owner: Repository owner
+        repo: Repository name
+        pr_info: Pull request information
+        files: Files changed in the PR
+        
+    Returns:
+        dict: Analysis results including AI review
+    """
+    # Get basic analysis first
+    basic_analysis = await analyze_pr_content(client, owner, repo, pr_info, files)
+    
+    # Prepare PR data for Gemini
+    pr_data = {
+        "title": pr_info.title,
+        "description": pr_info.body or "",
+        "author": pr_info.user.login,
+        "branch": pr_info.head.ref,
+        "base_branch": pr_info.base.ref,
+        "changed_files": [
+            {
+                "filename": file['filename'],
+                "status": file['status'],
+                "additions": file['additions'],
+                "deletions": file['deletions'],
+                "changes": file['changes'],
+                "patch": file.get('patch', "No patch available")
+            }
+            for file in files
+        ]
+    }
+    
+    # Create prompt for Gemini
+    prompt = """
+    You are an expert code reviewer. Review the following PR carefully and provide constructive feedback.
+    Your review should be formatted in markdown and include:
+    
+    1. A summary of the changes
+    2. Key observations and feedback
+    3. Specific issues found (if any)
+    4. Suggestions for improvement
+    5. Any security concerns or best practices that should be addressed
+    
+    Be concise but thorough. Provide actionable feedback that helps improve the code quality.
+    
+    PR DETAILS:
+    """
+    
+    # Add PR information to the prompt
+    prompt += json.dumps(pr_data)
+    
+    # Call Gemini API
+    try:
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+        if not gemini_api_key:
+            return {**basic_analysis, "ai_review": "Gemini API key not found in environment"}
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": gemini_api_key
+                },
+                json={
+                    "contents": [{
+                        "parts": [{
+                            "text": prompt
+                        }]
+                    }]
+                }
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    ai_review = result["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    ai_review = f"Error from Gemini API: {response.status}"
+    except Exception as e:
+        ai_review = f"Error generating AI review: {str(e)}"
+    
+    # Add AI review to analysis results
+    return {
+        **basic_analysis,
+        "ai_review": ai_review
+    }
+
+async def post_pr_comment(client, owner, repo, pr_number, analysis):
+    """
+    Post a PR comment with the analysis results.
+    
+    Args:
+        client: GitHub client
+        owner: Repository owner
+        repo: Repository name
+        pr_number: PR number
+        analysis: Analysis results including AI review
+    """
+    # Create comment body with basic stats and AI review
+    comment_body = f"""
+## PR Analysis Results
+
+Files changed: {analysis['file_count']}
+Total changes: {analysis['total_changes']} (+{analysis['additions']}, -{analysis['deletions']})
+
+File types:
+{format_file_types(analysis['file_types'])}
+
+{':warning: This is a large PR' if analysis['is_large_pr'] else ''}
+{':x: No test files detected' if not analysis['has_tests'] else ':white_check_mark: Test files included'}
+
+## 🤖 AI Code Review
+
+{analysis['ai_review']}
+
+---
+*Generated with Gemini AI*
+"""
+    
+    await client.issues.create_comment(
+        owner=owner,
+        repo=repo,
+        issue_number=pr_number,
+        body=comment_body
+    )
+
+def format_file_types(file_types):
+    """Format file types for display in markdown"""
+    return "\n".join([f"* {ext}: {count}" for ext, count in file_types.items()])
+
 def create_pr_comment(analysis_results):
     """
     Create a comment for a pull request based on analysis results.
     
     Args:
-        analysis_results: The analysis results
+        analysis_results: The analysis results including AI review
         
     Returns:
         str: The comment text
@@ -183,7 +320,7 @@ def create_pr_comment(analysis_results):
     for ext, count in analysis_results['file_types'].items():
         comment += f"- {ext}: {count}\n"
     
-    # Add warnings/suggestions
+    # Add warnings/suggestions based on basic analysis
     comment += "\n### Suggestions\n"
     
     if analysis_results['is_large_pr']:
@@ -191,6 +328,12 @@ def create_pr_comment(analysis_results):
     
     if not analysis_results['has_tests'] and analysis_results['file_count'] > 1:
         comment += "📝 **No test files detected.** Consider adding tests for your changes.\n"
+    
+    # Add AI review if available
+    if 'ai_review' in analysis_results and analysis_results['ai_review']:
+        comment += "\n## 🤖 AI Code Review\n\n"
+        comment += analysis_results['ai_review']
+        comment += "\n\n---\n*Generated with Gemini AI*"
     
     return comment
 
