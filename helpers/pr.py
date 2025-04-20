@@ -228,7 +228,7 @@ async def analyze_pr_content_with_gemini(client, owner, repo, pr_info, files):
         
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
                 headers={
                     "Content-Type": "application/json",
                     "x-goog-api-key": gemini_api_key
